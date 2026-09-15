@@ -282,7 +282,7 @@ export default function agentmemoryExtension(pi: ExtensionAPI) {
       const health = await getHealth();
       if (!health) {
         return {
-          content: [{ type: "text", text: "agentmemory is unreachable at http://localhost:3111" }],
+          content: [{ type: "text", text: `agentmemory is unreachable at ${normalizeBaseUrl(DEFAULT_URL)}` }],
           details: { ok: false },
         };
       }
