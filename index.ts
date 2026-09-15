@@ -1,9 +1,12 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import path from "node:path";
+import os from "node:os";
 import crypto from "node:crypto";
 import { execFileSync } from "node:child_process";
 import { createPlaintextBearerAuthGuard } from "./security.js";
+import { LocalOutbox } from "./src/outbox.js";
+import { Sender } from "./src/sender.js";
 
 type TextBlock = { type?: string; text?: string };
 type AssistantMessage = { role?: string; content?: unknown };
@@ -154,6 +157,17 @@ export default function agentmemoryExtension(pi: ExtensionAPI) {
   let lastPrompt = "";
   let lastHealthOk = false;
 
+  // Outbox-first capture: every observation is persisted to disk before
+  // delivery is attempted, so a dead server or a mid-flight crash cannot
+  // silently lose it; flush() retries queued records once the server is
+  // reachable again.
+  const outbox = new LocalOutbox(
+    path.join(os.homedir(), ".pi", "agent", "agentmemory", "outbox.jsonl"),
+  );
+  const sender = new Sender(outbox, async (payload) => {
+    return (await callAgentMemory("observe", { body: payload })) !== null;
+  });
+
   const toolObserveEnabled = process.env.AGENTMEMORY_TOOL_OBSERVE !== "0";
 
   // Skips the round-trip when an auto-retry re-submits an identical prompt.
@@ -234,7 +248,7 @@ export default function agentmemoryExtension(pi: ExtensionAPI) {
             text: `agentmemory status: ${health.status || health.health?.status || "unknown"}${health.version ? ` (v${health.version})` : ""}`,
           },
         ],
-        details: health,
+        details: { ok: true, ...health },
       };
     },
   });
@@ -300,6 +314,7 @@ export default function agentmemoryExtension(pi: ExtensionAPI) {
       await refreshStatus(ctx);
       // After refreshStatus: that is where lastHealthOk is first populated.
       if (lastHealthOk) {
+        await sender.flush();
         await callAgentMemory("session/start", {
           body: { sessionId, project: currentProject, cwd: currentCwd },
         });
@@ -313,16 +328,14 @@ export default function agentmemoryExtension(pi: ExtensionAPI) {
     lastPrompt = event.prompt?.trim() || "";
     if (!lastPrompt) return;
 
-    if (lastHealthOk && !isDuplicate(`prompt_submit:${sessionId}:${lastPrompt}`)) {
-      void callAgentMemory("observe", {
-        body: {
-          hookType: "prompt_submit",
-          sessionId,
-          project: currentProject,
-          cwd: currentCwd,
-          timestamp: new Date().toISOString(),
-          data: { prompt: lastPrompt },
-        },
+    if (!isDuplicate(`prompt_submit:${sessionId}:${lastPrompt}`)) {
+      sender.capture({
+        hookType: "prompt_submit",
+        sessionId,
+        project: currentProject,
+        cwd: currentCwd,
+        timestamp: new Date().toISOString(),
+        data: { prompt: lastPrompt },
       });
     }
 
@@ -344,7 +357,7 @@ export default function agentmemoryExtension(pi: ExtensionAPI) {
   });
 
   pi.on("tool_result", (event) => {
-    if (!toolObserveEnabled || !lastHealthOk || !sessionId) return;
+    if (!toolObserveEnabled || !sessionId) return;
     const toolName = event.toolName;
     if (!toolName) return;
     let input = "";
@@ -359,47 +372,45 @@ export default function agentmemoryExtension(pi: ExtensionAPI) {
     } catch {
       // non-serializable
     }
-    void callAgentMemory("observe", {
-      body: {
-        hookType: "post_tool_use",
-        sessionId,
-        project: currentProject,
-        cwd: currentCwd,
-        timestamp: new Date().toISOString(),
-        data: {
-          tool_name: toolName,
-          tool_input: input.slice(0, 8000),
-          tool_output: output.slice(0, 8000),
-          ...(event.isError ? { tool_error: true } : {}),
-        },
+    sender.capture({
+      hookType: "post_tool_use",
+      sessionId,
+      project: currentProject,
+      cwd: currentCwd,
+      timestamp: new Date().toISOString(),
+      data: {
+        tool_name: toolName,
+        tool_input: input.slice(0, 8000),
+        tool_output: output.slice(0, 8000),
+        ...(event.isError ? { tool_error: true } : {}),
       },
     });
   });
 
   pi.on("agent_end", async (event) => {
-    if (!lastHealthOk || !lastPrompt) return;
+    if (!lastPrompt) return;
     const assistantText = getLastAssistantText(event.messages as unknown[]);
     if (!assistantText) return;
-    void callAgentMemory("observe", {
-      body: {
-        hookType: "post_tool_use",
-        sessionId,
-        project: currentProject,
-        cwd: currentCwd,
-        timestamp: new Date().toISOString(),
-        data: {
-          tool_name: "conversation",
-          tool_input: lastPrompt.slice(0, 8000),
-          tool_output: assistantText.slice(0, 8000),
-        },
+    sender.capture({
+      hookType: "post_tool_use",
+      sessionId,
+      project: currentProject,
+      cwd: currentCwd,
+      timestamp: new Date().toISOString(),
+      data: {
+        tool_name: "conversation",
+        tool_input: lastPrompt.slice(0, 8000),
+        tool_output: assistantText.slice(0, 8000),
       },
     });
   });
 
   pi.on("session_shutdown", async (event) => {
     // /new, /resume, /fork and reloads fire this too; only quit ends the session.
-    if (event.reason !== "quit") return;
-    if (!lastHealthOk || !sessionId) return;
+    if (event.reason !== "quit" || !sessionId) return;
+    // Last chance to deliver anything queued while the server was down.
+    await sender.flush();
+    if (!lastHealthOk) return;
     // session/end already fans out the summary server-side (#1203).
     await callAgentMemory("session/end", {
       body: { sessionId },
