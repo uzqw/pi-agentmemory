@@ -7,6 +7,7 @@ import { execFileSync } from "node:child_process";
 import { createPlaintextBearerAuthGuard } from "./security.js";
 import { LocalOutbox } from "./src/outbox.js";
 import { Sender } from "./src/sender.js";
+import { HealthMonitor } from "./src/health.js";
 
 type TextBlock = { type?: string; text?: string };
 type AssistantMessage = { role?: string; content?: unknown };
@@ -155,7 +156,7 @@ export default function agentmemoryExtension(pi: ExtensionAPI) {
   let currentCwd = process.cwd();
   let currentProject = resolveProjectName(currentCwd);
   let lastPrompt = "";
-  let lastHealthOk = false;
+  const monitor = new HealthMonitor();
 
   // Outbox-first capture: every observation is persisted to disk before
   // delivery is attempted, so a dead server or a mid-flight crash cannot
@@ -191,40 +192,81 @@ export default function agentmemoryExtension(pi: ExtensionAPI) {
     return await callAgentMemory<HealthResponse>("health", { method: "GET" });
   }
 
-  async function refreshStatus(ctx: { ui: { setStatus: (key: string, text: string) => void } }) {
-    // Bind before the await: ctx goes stale if the session is replaced.
-    let setStatus: (key: string, text: string) => void;
-    try {
-      const ui = ctx.ui;
-      setStatus = ui.setStatus.bind(ui);
-    } catch {
-      return;
-    }
-    const health = await getHealth();
-    lastHealthOk =
+  function isHealthy(health: HealthResponse | null): boolean {
+    return (
       !!health &&
       (health.status === "ok" ||
         health.status === "healthy" ||
-        health.health?.status === "healthy");
+        health.health?.status === "healthy")
+    );
+  }
+
+  // Bound per ctx; the periodic supervisor reuses the last binding, which
+  // may be stale once the session is replaced — status is best-effort.
+  let setStatusLine: ((text: string) => void) | null = null;
+  let healthCheckInFlight = false;
+
+  async function checkHealth(): Promise<boolean> {
+    const ok = isHealthy(await getHealth());
+    // A transition to up doubles as the flush trigger: deliver whatever
+    // queued while the server was down.
+    if (monitor.report(ok, ok ? undefined : "health check failed") && monitor.state === "up") {
+      void sender.flush();
+    }
+    return ok;
+  }
+
+  function renderStatusLine(): string {
+    const queued = sender.queued();
+    if (monitor.state === "down") return `🧠 agentmemory down · ${queued} queued`;
+    if (queued > 0) return `🧠 agentmemory · ${queued} queued`;
+    return "🧠 agentmemory";
+  }
+
+  async function refreshStatus(ctx?: {
+    ui: { setStatus: (key: string, text: string) => void };
+  }) {
+    if (ctx) {
+      // Bind before the await: ctx goes stale if the session is replaced.
+      try {
+        const ui = ctx.ui;
+        setStatusLine = ui.setStatus.bind(ui, "agentmemory");
+      } catch {
+        return;
+      }
+    }
+    await checkHealth();
     try {
-      setStatus("agentmemory", lastHealthOk ? "🧠 agentmemory" : "🧠 agentmemory off");
+      setStatusLine?.(renderStatusLine());
     } catch {
       // status is best-effort
     }
   }
 
+  // Periodic supervision: while the server is down, re-check on an interval
+  // instead of waiting for the next session_start / before_agent_start.
+  const HEALTH_RECHECK_MS = 15_000;
+  const healthTimer = setInterval(() => {
+    if (healthCheckInFlight || monitor.state !== "down") return;
+    healthCheckInFlight = true;
+    void refreshStatus().finally(() => {
+      healthCheckInFlight = false;
+    });
+  }, HEALTH_RECHECK_MS);
+  healthTimer.unref();
+
   pi.registerCommand("agentmemory-status", {
-    description: "Check local agentmemory server health",
+    description: "Show agentmemory health state and outbox queue depth",
     handler: async (_args, ctx) => {
-      const health = await getHealth();
-      if (!health) {
-        ctx.ui.notify("agentmemory is unreachable at http://localhost:3111", "warning");
-        return;
-      }
-      ctx.ui.notify(
-        `agentmemory ${health.status || health.health?.status || "unknown"}${health.version ? ` v${health.version}` : ""}`,
-        "info",
-      );
+      // Cached state when up (avoids a round trip); fresh check otherwise.
+      if (monitor.state !== "up") await checkHealth();
+      const snap = monitor.snapshot();
+      const lines = [
+        `agentmemory: ${snap.state}${snap.lastTransitionAt ? ` (since ${snap.lastTransitionAt})` : ""}`,
+        ...(snap.failureReason ? [`last failure: ${snap.failureReason}`] : []),
+        `queued observations: ${sender.queued()}`,
+      ].join("\n");
+      ctx.ui.notify(lines, snap.state === "down" ? "warning" : "info");
     },
   });
 
@@ -312,8 +354,8 @@ export default function agentmemoryExtension(pi: ExtensionAPI) {
     // with the timeout cap. Health + session/start run in the background.
     void (async () => {
       await refreshStatus(ctx);
-      // After refreshStatus: that is where lastHealthOk is first populated.
-      if (lastHealthOk) {
+      // After refreshStatus: that is where the monitor is first populated.
+      if (monitor.state === "up") {
         await sender.flush();
         await callAgentMemory("session/start", {
           body: { sessionId, project: currentProject, cwd: currentCwd },
@@ -410,7 +452,7 @@ export default function agentmemoryExtension(pi: ExtensionAPI) {
     if (event.reason !== "quit" || !sessionId) return;
     // Last chance to deliver anything queued while the server was down.
     await sender.flush();
-    if (!lastHealthOk) return;
+    if (monitor.state !== "up") return;
     // session/end already fans out the summary server-side (#1203).
     await callAgentMemory("session/end", {
       body: { sessionId },
