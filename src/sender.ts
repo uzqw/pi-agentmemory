@@ -35,6 +35,8 @@ export class Sender {
 
   /** Deliver pending records in order; stop at the first failure. */
   async flush(): Promise<number> {
+    // ponytail: a flush trigger arriving mid-flush is dropped on purpose —
+    // the in-flight flush plus per-capture self-delivery already cover the queue.
     if (this.flushing) return 0;
     this.flushing = true;
     const delivered: string[] = [];

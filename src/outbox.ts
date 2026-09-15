@@ -32,6 +32,9 @@ export class LocalOutbox {
     };
     // ponytail: sync write survives process crash but not power loss;
     // add fs.fsyncSync if durability across power cuts matters.
+    // ponytail: append-only with no size cap — a long outage grows the file
+    // unboundedly and pending()/remove() are O(n) full-file passes (catch-up
+    // delivery is O(n²)); add rotation or a cap only if that ever matters.
     fs.appendFileSync(this.filePath, JSON.stringify(record) + "\n");
     return record;
   }
