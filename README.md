@@ -59,7 +59,7 @@ capture, `agent_end` capture, `session_shutdown`.
 
 ```bash
 mkdir -p ~/.pi/agent/extensions/agentmemory
-cp index.ts security.ts ~/.pi/agent/extensions/agentmemory/
+cp index.ts ~/.pi/agent/extensions/agentmemory/
 cp -r src ~/.pi/agent/extensions/agentmemory/src
 ```
 

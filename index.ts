@@ -4,7 +4,7 @@ import path from "node:path";
 import os from "node:os";
 import crypto from "node:crypto";
 import { execFileSync } from "node:child_process";
-import { createPlaintextBearerAuthGuard } from "./security.js";
+import { createPlaintextBearerAuthGuard } from "./src/security.js";
 import { LocalOutbox } from "./src/outbox.js";
 import { Sender } from "./src/sender.js";
 import { HealthMonitor } from "./src/health.js";
