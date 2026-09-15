@@ -60,7 +60,11 @@ capture, `agent_end` capture, `session_shutdown`.
 ```bash
 mkdir -p ~/.pi/agent/extensions/agentmemory
 cp index.ts security.ts ~/.pi/agent/extensions/agentmemory/
+cp -r src ~/.pi/agent/extensions/agentmemory/src
 ```
+
+`index.ts` imports `./src/outbox.js`, `./src/sender.js`, and `./src/health.js`
+at load time, so `src/` must be copied too or the extension fails to load.
 
 pi auto-discovers `~/.pi/agent/extensions/*/`; `/reload` hot-reloads.
 
