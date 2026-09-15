@@ -10,7 +10,7 @@ import { Sender } from "./src/sender.js";
 import { HealthMonitor } from "./src/health.js";
 
 type TextBlock = { type?: string; text?: string };
-type AssistantMessage = { role?: string; content?: unknown };
+type ConversationMessage = { role?: string; content?: unknown };
 type SmartSearchResult = {
   title?: string;
   narrative?: string;
@@ -49,7 +49,7 @@ function normalizeBaseUrl(url: string): string {
   return url.replace(/\/+$/, "");
 }
 
-function getText(content: unknown): string {
+export function getText(content: unknown): string {
   if (typeof content === "string") return content;
   if (!Array.isArray(content)) return "";
   return content
@@ -63,12 +63,12 @@ function getText(content: unknown): string {
     .trim();
 }
 
-function getLastAssistantText(messages: unknown[]): string {
+export function getLastTextByRole(messages: unknown[], role: string): string {
   for (const msg of [...messages].reverse()) {
     if (!msg || typeof msg !== "object") continue;
-    const assistant = msg as AssistantMessage;
-    if (assistant.role !== "assistant") continue;
-    const text = getText(assistant.content);
+    const message = msg as ConversationMessage;
+    if (message.role !== role) continue;
+    const text = getText(message.content);
     if (text) return text;
   }
   return "";
@@ -155,6 +155,9 @@ export default function agentmemoryExtension(pi: ExtensionAPI) {
   }
   let currentCwd = process.cwd();
   let currentProject = resolveProjectName(currentCwd);
+  // Fallback for agent_end pairing only: pi's run messages exclude the
+  // initiating user prompt (only steering/follow-up user messages land in a
+  // run's messages), so the prompt that started the run is tracked here.
   let lastPrompt = "";
   const monitor = new HealthMonitor();
 
@@ -430,9 +433,14 @@ export default function agentmemoryExtension(pi: ExtensionAPI) {
   });
 
   pi.on("agent_end", async (event) => {
-    if (!lastPrompt) return;
-    const assistantText = getLastAssistantText(event.messages as unknown[]);
+    const messages = event.messages as unknown[];
+    const assistantText = getLastTextByRole(messages, "assistant");
     if (!assistantText) return;
+    // The run's own messages win: a queued follow-up/steering message is in
+    // there and pairs with this answer; lastPrompt is only the fallback for
+    // the initiating prompt. A record can never pair across prompts.
+    const userText = getLastTextByRole(messages, "user") || lastPrompt;
+    if (!userText) return;
     sender.capture({
       hookType: "post_tool_use",
       sessionId,
@@ -441,7 +449,7 @@ export default function agentmemoryExtension(pi: ExtensionAPI) {
       timestamp: new Date().toISOString(),
       data: {
         tool_name: "conversation",
-        tool_input: lastPrompt.slice(0, 8000),
+        tool_input: userText.slice(0, 8000),
         tool_output: assistantText.slice(0, 8000),
       },
     });
