@@ -1,0 +1,31 @@
+{
+  "name": "pi-agentmemory",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Our own pi extension for agentmemory: recall on prompt submit, capture on turn end, memory_search / memory_save / memory_health tools, /agentmemory-status command. Forked from rohitg00/agentmemory integrations/pi, which we don't trust.",
+  "type": "module",
+  "license": "Apache-2.0",
+  "keywords": [
+    "pi-package",
+    "agentmemory",
+    "memory"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/uzqw/pi-agentmemory.git"
+  },
+  "files": [
+    "index.ts",
+    "security.ts",
+    "README.md"
+  ],
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  }
+}
